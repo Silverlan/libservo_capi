@@ -1,0 +1,110 @@
+name: Build and Release libservo-capi
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        type: choice
+        options:
+          - ubuntu
+          - windows
+          - both
+        default: ubuntu
+      tag:
+        description: 'Tag'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-libservo:
+    name: Build libservo on ${{ matrix.platform }}
+    runs-on: ${{ matrix.platform == 'windows' && 'windows-2025' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(github.event_name == 'workflow_dispatch' && (inputs.platform == 'both' && '["ubuntu","windows"]' || format('["{0}"]', inputs.platform)) || '["ubuntu","windows"]') }}
+
+    env:
+      ASSET_NAME: libservo-${{ matrix.platform }}-x86_64.tar.gz
+
+    steps:
+      # Windows: avoid MAX_PATH problems
+      - name: Enable long paths (Windows)
+        if: matrix.platform == 'windows'
+        run: git config --system core.longpaths true
+
+      # See https://book.servo.org/building/linux.html
+      # and https://book.servo.org/building/windows.html
+      - name: Checkout Servo Source
+        uses: actions/checkout@v4
+        with:
+          repository: 'servo/servo'
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install System Dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu'
+        run: |
+          sudo apt-get update
+          # https://book.servo.org/building/linux.html#dependencies-for-debian
+          sudo apt install -y build-essential ca-certificates ccache clang cmake curl g++ git gperf gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-tools libdbus-1-dev libegl1-mesa-dev libfreetype6-dev libges-1.0-dev libgl1-mesa-dri libgles2-mesa-dev libglib2.0-dev libgstreamer-plugins-bad1.0-dev libgstreamer-plugins-base1.0-dev libgstrtspserver-1.0-dev libharfbuzz-dev liblzma-dev libudev-dev libunwind-dev libvulkan1 libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0 libxkbcommon0 libxmu-dev libxmu6 llvm-dev m4 xorg-dev libgstreamer-plugins-good1.0-dev
+
+      - name: Setup Rust Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: default
+          override: true
+          components: rustc-dev, llvm-tools-preview
+
+      - name: Bootstrap Servo Environment (Mach)
+        shell: bash
+        run: |
+          ./mach bootstrap --skip-lints
+
+      - name: Build servo-capi (Release)
+        shell: bash
+        run: |
+          cargo build -p servo-capi --release --jobs 2
+
+      - name: Package Artifacts
+        shell: bash
+        run: |
+          mkdir -p release/lib
+          mkdir -p release/include
+
+          # Copy compiled libraries
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            mkdir -p release/bin
+            cp target/release/servo_capi.dll release/bin/ 2>/dev/null || true
+            cp target/release/servo_capi.dll.lib release/lib/ 2>/dev/null || true
+            # cp target/release/servo_capi.pdb release/lib/ 2>/dev/null || true
+          else
+            cp target/release/libservo_capi.so release/lib/ 2>/dev/null || true
+          fi
+
+          if [ -d "resources" ]; then
+            cp -r resources release/
+          fi
+
+          tar -czvf "$ASSET_NAME" -C release .
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libservo-${{ matrix.platform }}-pkg
+          path: ${{ env.ASSET_NAME }}
+
+      - name: Release Binaries
+        uses: Silverlan/common_actions/release_nightly_binaries@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit: ${{ github.ref_name }}
+          tag: "${{ github.event.inputs.tag }}"
+          release_suffix: '-clang'
